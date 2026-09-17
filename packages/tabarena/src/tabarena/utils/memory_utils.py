@@ -16,7 +16,12 @@ class CpuMemoryTracker:
         peak_rss: maximum observed total RSS
     """
 
-    def __init__(self, interval: float = 0.05, include_children: bool = True):
+    def __init__(
+        self,
+        interval: float = 0.05,
+        include_children: bool = True,
+        children_refresh_interval: float = 1.0,
+    ):
         """Parameters
         ----------
         interval : float, default=0.05
@@ -24,9 +29,19 @@ class CpuMemoryTracker:
         include_children : bool, default=True
             If True, include all descendant processes of the current process
             (e.g., Ray workers) in the RSS total.
+        children_refresh_interval : float, default=1.0
+            How often, in seconds, to re-discover the descendant processes. Discovery
+            (``psutil.Process.children``) reads ``/proc/<pid>/stat`` for every process on
+            the machine, which takes tens of milliseconds on a busy shared node; doing it
+            on every sample keeps the sampler thread busy and starves the fit of the GIL.
+            Between refreshes, the RSS of the last discovered descendants is still sampled
+            every ``interval``.
         """
         self.interval = interval
         self.include_children = include_children
+        self.children_refresh_interval = children_refresh_interval
+        self._children: list[psutil.Process] = []
+        self._children_refreshed_at: float | None = None
 
         self._proc = psutil.Process(os.getpid())
         self._stop_flag = False
@@ -44,13 +59,19 @@ class CpuMemoryTracker:
         procs = [self._proc]
 
         if self.include_children:
-            try:
-                # recursive=True to get workers spawned by Ray, etc.
-                children = self._proc.children(recursive=True)
-                procs.extend(children)
-            except psutil.Error:
-                # If we can't query children for some reason, just skip them
-                pass
+            now = time.monotonic()
+            if (
+                self._children_refreshed_at is None
+                or now - self._children_refreshed_at >= self.children_refresh_interval
+            ):
+                try:
+                    # recursive=True to get workers spawned by Ray, etc.
+                    self._children = self._proc.children(recursive=True)
+                except psutil.Error:
+                    # If we can't query children for some reason, keep the last known ones
+                    pass
+                self._children_refreshed_at = now
+            procs.extend(self._children)
 
         for p in procs:
             try:
